@@ -57,7 +57,7 @@ test('routing stays isolated between requests and only normalizes Docker Hub pat
     return new Response(null);
   }, async () => {
     await worker.fetch(new Request('https://quay.example.com/v2/org/image/tags/list'));
-    await worker.fetch(new Request(`${origin}/v2/nginx/manifests/latest`));
+    await worker.fetch(new Request(`${origin}/v2/nginx/manifests/latest`, { headers: { authorization: 'Bearer test-token' } }));
     await worker.fetch(new Request(`${origin}/v2/org/image/manifests/latest?ns=ghcr.io`));
     await worker.fetch(new Request(`${origin}/v2/`));
     assert.deepEqual(urls, [
@@ -96,5 +96,58 @@ test('preflight returns requested headers without fetching upstream', async () =
     }));
     assert.equal(result.status, 204);
     assert.equal(result.headers.get('access-control-allow-headers'), 'authorization');
+  });
+});
+
+
+test('legacy search and browser search use the updated upstream hosts', async () => {
+  const urls = [];
+  await withFetch(async request => {
+    urls.push(request.url);
+    return new Response(null);
+  }, async () => {
+    await worker.fetch(new Request(`${origin}/v1/search?q=library/nginx`));
+    await worker.fetch(new Request(`${origin}/v1/repositories/library/nginx/tags`));
+    await worker.fetch(new Request(`${origin}/search?q=nginx`, { headers: { 'user-agent': 'Mozilla/5.0' } }));
+    assert.deepEqual(urls, [
+      'https://index.docker.io/v1/search?q=nginx',
+      'https://index.docker.io/v1/repositories/library/nginx/tags',
+      'https://hub.docker.com/search?q=nginx',
+    ]);
+  });
+});
+
+test('anonymous tag indexing obtains a repository-scoped token', async () => {
+  let calls = 0;
+  await withFetch(async input => {
+    if (++calls === 1) {
+      assert.equal(input.origin, 'https://auth.docker.io');
+      assert.equal(input.searchParams.get('scope'), 'repository:library/nginx:pull');
+      return Response.json({ token: 'anonymous-token' });
+    }
+    assert.equal(input.url, 'https://registry-1.docker.io/v2/library/nginx/tags/list');
+    assert.equal(input.headers.get('authorization'), 'Bearer anonymous-token');
+    return Response.json({ tags: ['latest'] });
+  }, async () => {
+    const result = await worker.fetch(new Request(`${origin}/v2/library/nginx/tags/list`));
+    assert.deepEqual(await result.json(), { tags: ['latest'] });
+    assert.equal(calls, 2);
+  });
+});
+
+test('failed anonymous token lookup falls back to the registry challenge', async () => {
+  let calls = 0;
+  await withFetch(async input => {
+    if (++calls === 1) return new Response(null, { status: 401 });
+    assert.equal(input.headers.has('authorization'), false);
+    return new Response(null, {
+      status: 401,
+      headers: { 'www-authenticate': 'Bearer realm="https://auth.docker.io/token"' },
+    });
+  }, async () => {
+    const result = await worker.fetch(new Request(`${origin}/v2/private/image/tags/list`));
+    assert.equal(result.status, 401);
+    assert.equal(result.headers.get('www-authenticate'), `Bearer realm="${origin}/token"`);
+    assert.equal(calls, 2);
   });
 });
